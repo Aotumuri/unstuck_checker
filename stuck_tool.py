@@ -29,6 +29,8 @@ import glob
 import json
 import math
 import os
+import time
+import sys
 from statistics import pstdev
 from typing import Dict, List, Tuple, Iterable, Optional
 
@@ -89,17 +91,45 @@ def scan_glob_for_metrics(glob_pattern: str, window: int) -> List[Tuple[str, int
     グロブに一致する全 JSON からウィンドウごとの metric を収集。
     Returns: list of (path, start_step, end_step, metric)
     """
+    # 内部ヘルパー: 進捗バー（同じ行上書き）
+    def _print_bar(cur: int, total: int, label: str = "") -> None:
+        if total <= 0:
+            return
+        ratio = cur / total
+        bar_len = 24
+        fill = int(bar_len * ratio)
+        bar = "█" * fill + "-" * (bar_len - fill)
+        sys.stdout.write(f"\r[{bar}] {cur}/{total} {label}")
+        sys.stdout.flush()
+        if cur >= total:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
     results: List[Tuple[str, int, int, float]] = []
-    for path in sorted(glob.glob(glob_pattern, recursive=True)):
-        if not path.lower().endswith(".json"):
-            continue
+    paths_all = sorted(glob.glob(glob_pattern, recursive=True))
+    json_paths = [p for p in paths_all if p.lower().endswith(".json")]
+    total = len(json_paths)
+
+    # 50ステップ程度で更新される頻度にする（最小1）
+    step = max(1, total // 50)
+    # 見出し
+    print(f"[SCAN] {glob_pattern}  files={total}", flush=True)
+
+    for i, path in enumerate(json_paths, 1):
         try:
             series = load_series_from_json(path)
         except Exception as e:
-            print(f"[WARN] 読込失敗: {path}: {e}")
+            print(f"[WARN] 読込失敗: {path}: {e}", flush=True)
+            # 進捗の更新
+            if (i % step == 0) or (i == total):
+                _print_bar(i, total, label="files")
             continue
         for start, end, m in contiguous_window_metrics(series, window):
             results.append((path, start, end, m))
+        # 進捗の更新
+        if (i % step == 0) or (i == total):
+            _print_bar(i, total, label="files")
+
     return results
 
 def longest_contiguous_run(steps: List[int]) -> int:
@@ -231,11 +261,27 @@ def cmd_verify(args: argparse.Namespace) -> None:
     YELLOW = "\033[33m"
     RESET = "\033[0m"
 
+    def _acc_color(acc_val: float) -> str:
+        # しきい値は見やすさ優先（>=95%: green, >=80%: yellow, else red）
+        if acc_val >= 95.0:
+            return GREEN
+        if acc_val >= 80.0:
+            return YELLOW
+        return RED
+
+    def _fmt_int(n: int) -> str:
+        return f"{n:,}"
+
     thr = args.threshold
     win = args.window
 
     # カウント
     ok_stuck = ng_stuck = 0
+    # per-file 成功率集計用
+    per_file: Dict[str, Dict[str, int]] = {}
+    def _pf_inc(path: str, key: str) -> None:
+        d = per_file.setdefault(path, {"ok": 0, "ng": 0})
+        d[key] += 1
     ok_unstuck = ng_unstuck = 0
 
     print(f"=== VERIFY (window = {win}, threshold = {thr}) ===")
@@ -257,11 +303,13 @@ def cmd_verify(args: argparse.Namespace) -> None:
         for path, start, end, m in stuck_metrics:
             if m <= thr:
                 ok_stuck += 1
+                _pf_inc(path, "ok")
                 msg = f"{GREEN}[OK]{RESET}[stuck]   {path}  steps {start}..{end}  metric={m:.6f}  (<= {thr})"
                 print(msg)
                 logf.write(f"[OK][stuck]   {path}  steps {start}..{end}  metric={m:.6f}  (<= {thr})\n")
             else:
                 ng_stuck += 1
+                _pf_inc(path, "ng")
                 msg = f"{RED}[NG]{RESET}[stuck]   {path}  steps {start}..{end}  metric={m:.6f}  expected <= {thr}"
                 print(msg)
                 logf.write(f"[NG][stuck]   {path}  steps {start}..{end}  metric={m:.6f}  expected <= {thr}\n")
@@ -274,11 +322,13 @@ def cmd_verify(args: argparse.Namespace) -> None:
         for path, start, end, m in unstuck_metrics:
             if m > thr:
                 ok_unstuck += 1
+                _pf_inc(path, "ok")
                 msg = f"{GREEN}[OK]{RESET}[unstuck] {path}  steps {start}..{end}  metric={m:.6f}  (> {thr})"
                 print(msg)
                 logf.write(f"[OK][unstuck] {path}  steps {start}..{end}  metric={m:.6f}  (> {thr})\n")
             else:
                 ng_unstuck += 1
+                _pf_inc(path, "ng")
                 msg = f"{RED}[NG]{RESET}[unstuck] {path}  steps {start}..{end}  metric={m:.6f}  expected > {thr}"
                 print(msg)
                 logf.write(f"[NG][unstuck] {path}  steps {start}..{end}  metric={m:.6f}  expected > {thr}\n")
@@ -293,10 +343,52 @@ def cmd_verify(args: argparse.Namespace) -> None:
         print(f"unstuck : OK={ok_unstuck}  NG={ng_unstuck}")
         print(f"overall : OK={total_ok}  NG={total_ng}  ACC={acc:.2f}%")
 
+        # ファイル別サマリー（表形式）
+        print("\n--- PER-FILE SUMMARY ---")
+        entries = []
+        for p in per_file:
+            ok = per_file[p]["ok"]
+            ng = per_file[p]["ng"]
+            tot = ok + ng
+            acc_p = (ok / tot * 100.0) if tot > 0 else 0.0
+            entries.append((p, ok, ng, acc_p))
+
+        def _print_table(title: str, rows: List[Tuple[str, int, int, float]]) -> None:
+            if not rows:
+                return
+            # ファイル名はベース名で表示し、親ディレクトリは右側にうすく
+            import os
+            name_col = max(24, min(48, max(len(os.path.basename(p)) for p, *_ in rows)))
+            print(f"\n[{title}]")
+            header = f"{'FILE':<{name_col}}  {'OK':>8}  {'NG':>8}  {'ACC%':>7}"
+            print(header)
+            print("-" * len(header))
+            # 読みやすさのため ACC 昇順（悪い順）に並べる
+            for p, ok, ng, acc_p in sorted(rows, key=lambda r: r[3]):
+                base = os.path.basename(p)
+                color = _acc_color(acc_p)
+                print(f"{base:<{name_col}}  {_fmt_int(ok):>8}  {_fmt_int(ng):>8}  {color}{acc_p:>6.2f}%{RESET}")
+
+        stuck_rows = [(p, ok, ng, acc) for (p, ok, ng, acc) in entries if p.startswith('stuck/')]
+        unstuck_rows = [(p, ok, ng, acc) for (p, ok, ng, acc) in entries if p.startswith('unstuck/')]
+        other_rows = [(p, ok, ng, acc) for (p, ok, ng, acc) in entries if (not p.startswith('stuck/') and not p.startswith('unstuck/'))]
+
+        _print_table("stuck", stuck_rows)
+        _print_table("unstuck", unstuck_rows)
+        _print_table("others", other_rows)
+
         logf.write(f"--- SUMMARY ---\n")
         logf.write(f"stuck   : OK={ok_stuck}  NG={ng_stuck}\n")
         logf.write(f"unstuck : OK={ok_unstuck}  NG={ng_unstuck}\n")
         logf.write(f"overall : OK={total_ok}  NG={total_ng}  ACC={acc:.2f}%\n")
+        logf.write(f"--- PER-FILE SUMMARY ---\n")
+        logf.write("path,ok,ng,acc%\n")
+        for p in sorted(per_file.keys()):
+            ok = per_file[p]['ok']
+            ng = per_file[p]['ng']
+            tot = ok + ng
+            acc_p = (ok / tot * 100.0) if tot > 0 else 0.0
+            logf.write(f"{p},{ok},{ng},{acc_p:.2f}\n")
         logf.write(f"=== VERIFY END ===\n\n")
 
 def main():
